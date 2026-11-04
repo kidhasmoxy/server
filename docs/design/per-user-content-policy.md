@@ -1,4 +1,4 @@
-# Per user music content policy
+# User and player music content policy
 
 Status: implementation design, not implemented or accepted upstream. Updated 2026-11-04.
 
@@ -6,7 +6,7 @@ Inspected base: Music Assistant server `dev`, commit `c2501db1f6197189d981baf367
 
 ## Decision
 
-Implement an administrator-managed **Allow explicit music** setting per Music Assistant user. When disabled, the server hides explicit tracks from that user's discovery responses and rejects explicit recordings before preparing or delivering audio. Albums, playlists, artist playback, and autoplay continue with eligible tracks. Kiosk Satellite keeps its native Music Library and existing Music Assistant user token.
+Implement an administrator-managed **Allow explicit music** setting per Music Assistant user and player. Playback applies the strictest user, sticky queue, and destination-player policy. User policy filters discovery everywhere; destination policy additionally filters discovery when the client supplies an authorized destination. Albums, playlists, artist playback, and autoplay continue with eligible tracks. Kiosk Satellite keeps its native Music Library and existing Music Assistant user token. Apple Music is the first verified provider, using ratings from existing album responses rather than a second per-track lookup service.
 
 Enforcement belongs in the server, using provider metadata and existing queue/stream machinery. No Kiosk fork, replacement library UI, background skip watcher, external gateway, or runtime monkey patch is required. Until upstream accepts the changes, deployment requires a maintained server build. Small patches reduce rebase effort; they do not eliminate builds. A frontend contribution supplies the setting UI; the server API can configure the first deployment independently.
 
@@ -20,7 +20,7 @@ Queue restrictions are sticky. Once a restricted user starts or contributes musi
 - Keep the evaluator pure, policy context explicit, provider adapters small, and protocol changes additive.
 - Never delete tracks from the shared library or edit original service playlists to create a filtered view.
 
-Initial scope is recorded music tracks and containers. Podcast/audiobook age policies, automatic clean-edition substitution, lyric classification, and permanent room restrictions are separate features. Existing audiobook and approved story-source access must continue working. Classification uses trusted provider/media identity, never a client claim that music is an audiobook.
+Initial scope is recorded music tracks and containers. Podcast/audiobook age policies, automatic clean-edition substitution, and lyric classification are separate features. Player restrictions are persistent settings for MA-controlled playback, not control over external speaker apps. Existing audiobook and approved story-source access must continue working. Classification uses trusted provider/media identity, never a client claim that music is an audiobook.
 
 External AirPlay, line-in, native speaker apps, and audio already buffered on a speaker are outside the server's ability to retroactively filter. MA-controlled attempts to switch a restricted queue to opaque music URLs or live music must be refused until an authorized user explicitly resets it. Track-resolved provider radio is supported through per-track admission; an opaque continuous stream cannot satisfy this contract. Arbitrary media must not enter through an announcement exception: existing announcement permissions remain separate and cannot be used by a restricted token to submit unrestricted music.
 
@@ -115,9 +115,19 @@ Effective policy is the component-wise strictest combination of stored queue res
 | Ungroup | Each resulting queue retains inherited restrictions |
 | Authorized reset | Check revision, quiesce playback, set policy to resetting actor's policy, replace contributors, increment revision |
 
-An unrestricted adult may explicitly reset a queue, as agreed for this use case. This does not permanently protect a room against an authorized adult. Reset changes policy only, never starts playback. Unauthorized attempts leave queue and policy unchanged.
+An unrestricted adult may explicitly reset a queue, as agreed for this use case, but the effective result still includes destination-player restrictions. Only an administrator changing the player's separate setting can relax that floor. Reset changes policy only, never starts playback. Unauthorized attempts leave queue and policy unchanged.
 
-Discovery uses the requesting user's policy. Playback combines actor and destination queue restrictions. An adult may see an explicit track but receive “This queue filters explicit music” when sending it to a restricted destination.
+Discovery always uses the requesting user's policy and optionally the selected destination policy, as described below. An adult using a client without destination-aware search may see an explicit track but receive a content-policy error when sending it to a restricted destination.
+
+### Player policy and destination context
+
+Add administrator-managed `block_explicit`, `block_unrated`, and revision fields to persistent player configuration, defaulting to false. Use the established player-config migration and validation path, but require `USERS_MANAGE` or equivalent administrator-only authority for these fields: ordinary player configuration permission must not let a restricted service account weaken enforcement. Never use queue ownership or a display name as the player-policy key.
+
+Effective playback policy is the component-wise strictest of actor policy, durable queue policy, group policy, and every actual destination player's policy. Queue reset cannot weaken a player restriction. A restricted user remains restricted on an unrestricted player; an unrestricted user remains restricted on a restricted player. Both the logical group and physical MA member identities contribute where applicable. Unknown or changing membership blocks handoff until resolved.
+
+Apply player changes through the same revision-checked stop/flush/revalidation transition as user changes. Group joining, leader changes, transfers, and ungrouping must recompute destination restrictions before output, including when the initiator is an adult or automation. A physical player restriction persists independently of queue clearing, transfer, or cache eviction. Relaxing it does not implicitly clear a sticky queue restriction.
+
+For destination-aware browsing, add an optional player/queue context to applicable discovery APIs, validate access, resolve group membership server-side, and include the destination policy revision in filtered-response cache keys. Do not trust restrictions supplied by a client. Requests without destination context retain user-only discovery filtering, with full player enforcement at playback. Verify Kiosk's actual request contract before promising destination-sensitive search without an APK update. Using a restricted user account on the kids' Kiosk provides filtered browsing immediately; player policy protects those speakers from other accounts.
 
 ## Enforcement architecture
 
@@ -126,6 +136,7 @@ flowchart TD
   A[Authenticated request] --> U[Resolve user policy]
   U --> D[Filter discovery response]
   U --> Q[Persist effective queue policy]
+  S[Player and group restrictions] --> Q
   Q --> C[Expand collections and admit tracks]
   C --> R[Resolve exact provider candidate]
   R --> V[Check rating and policy revision]
@@ -193,6 +204,46 @@ If persistence, stop, or reconciliation fails, retain restrictions and keep the 
 
 Audio already delivered cannot be recalled. Activation completes only after the supported player stop/flush transition. Document residual device buffering and do not promise retrospective silence. Under an already-active restriction, a prohibited new recording must never reach provider audio-acquisition or output spies in tests.
 
+## Apple Music performance plan
+
+### Evidence and request strategy
+
+At the pinned base, `providers/apple_music/media.py:get_album_tracks` fetches the album track relationship and parses each song through `parse_track`. Catalog albums use `catalog/{storefront}/albums/{id}/tracks`; library albums request `include=catalog,artists`. `parsers.py` maps a present `contentRating` into the shared explicit flag. Reuse this response for rating decisions rather than fetching every song again. Search song responses use the same parser and can supply rating evidence too.
+
+Apple documents an optional song `contentRating`: absent means unrated, not a failed lookup. Distinguish an authoritative unrated song from a lightweight/incomplete reference. Persist provenance alongside cached evidence: exact provider instance, storefront, catalog/library identity, metadata completeness, observed time and evidence revision. Do not infer completeness from `explicit == None` alone or rewrite it to false.
+
+For complete successful metadata, normal explicit blocking excludes `explicit`, permits `clean`, and handles missing ratings using the configured unrated policy. Neither permissive nor strict unrated handling needs to retry a known-unrated song: allow or exclude it respectively. Incomplete references can be hydrated through Apple's batch catalog-song endpoint, which documents up to 300 IDs per request. Use the existing authenticated provider client and throttler; batch only missing records, map results by ID rather than response order, and treat omitted/unavailable IDs separately. Library IDs must be resolved through their catalog relationships, never passed as catalog IDs by assumption.
+
+The local kids plugin's `AppleRatings.java` instead calls the iTunes lookup API, spaces starts by 3.1 seconds, and retries unknowns. Album logic uses batches of 20 on a single metadata executor, and Add/Play next waits for the eligible batch before queueing. This is a source-verified latency mechanism, not a measured attribution for a particular household request. Apple's iTunes API documents approximately 20 calls per minute. Do not carry that fallback into the standard MA playback path.
+
+### Album execution
+
+1. Reuse complete album-response metadata and cached evidence. Evaluate user/player/queue flags locally and enqueue permitted tracks through the existing collection path.
+2. If the first available page contains eligible tracks, start normal playback without awaiting later pages. Preserve album order and original track numbers; bind continuation to the queue generation and policy revisions.
+3. For Add/Play next, reuse native queue ordering/reservation semantics if available. Otherwise stage the batch atomically; never append later pages behind a subsequently queued album. Complete metadata should still avoid per-track network calls.
+4. Hydrate genuinely incomplete records in bounded batches. Never enqueue unverified records speculatively. A slow earlier unknown item needs a defined skip/error outcome before later tracks proceed; do not silently reorder the album.
+5. Warm evidence for upcoming tracks before stream preparation. Reuse it at the final exact-recording gate, rechecking only policy/revision and freshness. A different fallback identity needs its own evidence.
+
+At this base, the album method processes the returned `data` array without visibly following `next`, and its cache decorator allows expired results. Audit long-album pagination and stale-cache semantics before enabling enforcement. Keep evidence freshness separate from general artwork/catalog freshness. Initial enforcement TTL proposal: 24 hours for successful rating evidence, configurable internally for testing; expired evidence is refreshed in batches before admission, preferably in the background. Never use stale clean/unrated evidence merely because the general media cache permits it. Known explicit evidence stays blocked until a successful newer authoritative response supersedes it. TTL is a tradeoff: provider rating changes can remain undetected until refresh, so metadata correctness cannot be guaranteed beyond the provider/cache contract.
+
+Single-flight identical metadata requests, cap concurrency through the existing provider throttler, and cancel stale work after selection changes. The inspected Apple client already implements throttling/retries; its configured rate is not a provider-guaranteed capacity. Do not create a second retry loop that multiplies backoff. On a cold outage, fail promptly with a retriable status within the client request budget rather than blocking indefinitely or assuming a clean rating.
+
+### Performance acceptance
+
+Targets below are proposed, not benchmark results. Compare against unmodified MA on identical hardware, player, account, storefront, album IDs, and queue mode. Measure server filtering overhead separately from Apple/network/speaker startup. Test cold/warm caches, mixed and unrated albums, long paginated albums, concurrent users and grouping. Start with at least 30 paired runs per principal scenario and expand if tail measurements are unstable; preserve raw timings and request counts.
+
+| Metric | Initial target |
+| --- | --- |
+| Complete, fresh album metadata | Zero extra rating-related provider requests |
+| Warm filtering overhead | Under 100 ms server-side p95 |
+| First audio with complete metadata | Within 250 ms of unfiltered MA p95 |
+| Add/Play next with complete metadata | Within 250 ms of unfiltered MA queue acknowledgement p95 |
+| Incomplete metadata | Batch hydration, never one serial request per song |
+| Known unrated songs | No repeated lookup solely to seek a clean label |
+| Destination/policy change | Reuse fresh raw rating evidence; invalidate decisions, not all metadata |
+
+A performance miss blocks release until profiled, optimized, or explicitly accepted as a documented tradeoff. Never improve timings by bypassing final audio enforcement. Native MA may still fetch individual tracks for other purposes; report rating-attributable calls separately rather than claiming the entire playback path uses one request.
+
 ## Integration map
 
 Paths are relative to `music_assistant/` at the pinned base. Recheck on every rebase; keep one evaluator rather than duplicating policy logic at each seam.
@@ -209,6 +260,7 @@ Paths are relative to `music_assistant/` at the pinned base. Recheck on every re
 | Preload and buffer reuse | `controllers/player_queues/stream_feeder.py` |
 | Actual candidate selection and output | `controllers/streams/audio.py`, `stream_sources.py` |
 | Stream sessions and grouping | `controllers/streams/controller.py`, `controllers/players/` |
+| Persistent player restrictions | Existing player config schema/controller, with administrator-only policy mutations |
 | Metadata normalization | Provider parsers or provider implementation |
 
 At this base, `state.py` already persists `userid` separately from the wire model. `audio.py` centralizes candidate ranking, fallback, and buffer reuse. Extend those seams rather than creating a parallel playback engine. Shared wire types live in `music-assistant/models`; frontend interfaces in `music-assistant/frontend`. Keep private provenance server-side; require cross-repository changes only for actual public contracts.
@@ -244,13 +296,15 @@ Use deterministic provider fixtures and fake audio sinks. Assert absence of prov
 | Audio | Preload, shared buffers, flow mode, crossfade/Smart Fades, stale URLs, direct handoff |
 | Lifecycle | Adult contribution retains policy; stop/clear/restart/cache eviction retain floor; contributor deletion |
 | Groups | Transfer both ways, joining adult playback, leader change, ungroup, concurrent reset/group |
+| Player policies | Adult-to-restricted-player denial, child-to-unrestricted-player denial, queue reset cannot override player, persistent config and membership resolution |
+| Apple performance | Complete/unrated/incomplete responses, batch omissions, storefront isolation, long-album pagination, expired evidence, no extra fresh-rating requests |
 | Races | Tightening during metadata await, resolution, preload, output, lazy append, autoplay |
 | Recovery | Crash between persistence/transition, malformed cache, metadata/auth-store outage, player stop failure |
 | Compatibility | Unrestricted regression suite, old clients, ACLs, books/stories, announcements, service identities |
 
 Kiosk integration uses the native Music Library: search, mixed album views, Play now/next/add, album shuffle, favorites, queue jumps, grouping, reconnect and server restart. Confirm no APK changes and explicitly verify the restricted MA identity in the Kiosk configuration.
 
-Measure cold/warm search and album latency, provider calls, cache hits, and pagination cost against the pinned unmodified base. Warm fully rated responses should add no provider calls. Bound concurrency using existing provider rate limits. Record measurements before selecting hard latency targets.
+Measure cold/warm search and album latency, provider calls, cache hits, and pagination cost against the pinned unmodified base using the performance targets above. Targets remain unverified until measured; preserve existing provider rate limits.
 
 Run focused policy/auth/migration/resolver/audio tests, relevant upstream tests, and required `pre-commit run --all-files`. Verify clean install, upgrade from the base, and restore from a pre-feature backup in isolated data directories. Never test migrations against the household's live database.
 
@@ -259,13 +313,45 @@ Run focused policy/auth/migration/resolver/audio tests, relevant upstream tests,
 Keep commits independently understandable and avoid unrelated reformatting. Incomplete enforcement stays behind a default-off internal development gate. Do not expose the user switch before all audio and lifecycle gates pass.
 
 1. Policy contract, pure evaluator, tri-state normalization fixtures, reason codes, unit tests.
-2. Protected persistence and API: migrations, permissions, revisions, compatibility defaults.
+2. Protected user/player persistence and API: migrations, administrator-only permissions, revisions, compatibility defaults.
 3. Queue lifecycle: durable restriction, contributors, reset, restore, grouping/transfer, generation checks.
 4. Audio enforcement: candidates, fallback, cached details/buffers, preload/output leases and denial tests.
 5. Discovery and collections: filtered responses, pagination, shared resolver/autoplay admission and events.
 6. Client configuration/release: frontend settings/status, translated errors, Kiosk integration; enable only after acceptance.
 
 Upstream PRs may separate reusable prerequisites, but production enabling waits for all enforcement dependencies. Independent provider fixes can be submitted separately. Publishing this design does not authorize an automatic upstream PR or message.
+
+## Risk mitigation and rollout
+
+| Risk | Mitigation and release gate |
+| --- | --- |
+| Explicit audio through fallback/preload/cache reuse | Instrument provider acquisition and output; require zero denied-recording calls/bytes across the audio-path matrix |
+| Missing rating interpreted as clean | Preserve tri-state plus completeness/provenance; known-unrated is a policy decision, failed fetch is an error |
+| Album latency or Apple throttling | Reuse listing metadata, batch only incomplete records, single-flight caches, paired benchmarks; no iTunes hot-path dependency |
+| Queue/group race or adult controller bypass | Durable queue floor plus independent player policy, generation/revision checks and stop/flush before group handoff |
+| Policy loss after crash/cache clear | Durable authority outside evictable cache, migration/recovery fixtures, blocked restoration for corrupt restrictions |
+| Stale rating or provider mislabeling | Bounded freshness and background refresh; state the metadata limitation rather than promise lyric-level safety |
+| Kiosk lacks destination context | Restricted user supplies filtered discovery; enforce destination at playback; defer optional destination-aware UI changes |
+| Broader provider assumptions | Apple-first verified support; fixture/contract tests before advertising other services |
+| Upstream divergence | Small commits, pinned bases, range-diff and behavior tests on every rebase; no runtime monkey patches |
+| Downgrade silently removes protection | Explicit rollback procedure: stop protected playback, block restricted access, restore known backup; retain current deployment until replacement passes |
+
+Begin with a read-only metadata/latency probe and an isolated server using synthetic providers and a test sink. Then run Apple integration on a test player. A diagnostic observe-only mode may compare decisions but must be labeled non-enforcing and never used as kids protection. Enable a limited household pilot only after denial, persistence, player/group and performance gates pass. Keep deployment reversible using separate data and image versions; do not switch the household merely to gather benchmarks. Upstream submission is separate from local deployment approval.
+
+## Effort estimate
+
+Planning estimate for one engineer familiar with async Python, using the existing MA provider/client and available Apple/test-player access. These are engineering days, not elapsed agent runtime or a delivery promise. Estimates include implementation and testing; upstream review/merge time and account/hardware access delays are excluded.
+
+| Phase | Effort |
+| --- | --- |
+| Apple response fixtures, installed-version audit and baseline benchmark | 1–2 days |
+| Shared evaluator, protected user/player persistence and APIs | 2–3 days |
+| Queue/group lifecycle and complete audio-path enforcement | 3–5 days |
+| Apple discovery, batching/cache/pagination and performance tuning | 2–3 days |
+| Configuration UI, Kiosk acceptance, migration/recovery and release checks | 2–4 days |
+| Total before contingency | 10–17 engineering days |
+
+Budget 12–22 engineering days including roughly 20–30% contingency: about 3–5 calendar weeks for one full-time engineer. An isolated Apple-first API-configured pilot may be possible in 5–8 engineering days if existing seams hold; it is not the complete supported release and must not skip enforcement gates. Re-estimate after the first 1–2 days using actual responses, installed/upstream differences, player buffering behavior, and Kiosk API compatibility. Additional provider certification and upstream-requested redesign add scope.
 
 ## Maintenance and upstream strategy
 
@@ -282,5 +368,7 @@ Release gates require evidence that all audio paths are covered and policy survi
 - [Pinned source and contribution instructions](https://github.com/music-assistant/server/tree/c2501db1f6197189d981baf367e43c902569fc20).
 - [Queue state](https://github.com/music-assistant/server/blob/c2501db1f6197189d981baf367e43c902569fc20/music_assistant/controllers/player_queues/state.py), [stream selection](https://github.com/music-assistant/server/blob/c2501db1f6197189d981baf367e43c902569fc20/music_assistant/controllers/streams/audio.py), and [auth persistence](https://github.com/music-assistant/server/blob/c2501db1f6197189d981baf367e43c902569fc20/music_assistant/controllers/webserver/auth.py) identify implementation seams.
 - [Apple song attributes](https://developer.apple.com/documentation/applemusicapi/songs/attributes-data.dictionary) define ratings and missing-value meaning.
+- [Apple album relationships](https://developer.apple.com/documentation/applemusicapi/handling-resource-representation-and-relationships) and [batch catalog songs](https://developer.apple.com/documentation/applemusicapi/get-multiple-catalog-songs-by-id) describe collection responses and the 300-ID maximum.
+- [iTunes API documentation](https://performance-partners.apple.com/search-api) documents the approximate 20-call-per-minute limit of the secondary lookup service.
 - [Apple parser](https://github.com/music-assistant/server/blob/c2501db1f6197189d981baf367e43c902569fc20/music_assistant/providers/apple_music/parsers.py), [Spotify parser](https://github.com/music-assistant/server/blob/c2501db1f6197189d981baf367e43c902569fc20/music_assistant/providers/spotify/parsers.py), and [Tidal parser](https://github.com/music-assistant/server/blob/c2501db1f6197189d981baf367e43c902569fc20/music_assistant/providers/tidal/parsers.py) show metadata normalization entry points.
 - [Kiosk Music Assistant SDK](https://github.com/jxlarrea/kiosk-satellite-plugins/blob/main/docs/music-assistant.md) documents calls/events through the configured MA identity, not a universal pre-play interceptor.

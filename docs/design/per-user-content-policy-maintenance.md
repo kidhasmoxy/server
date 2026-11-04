@@ -1,6 +1,6 @@
 # Maintaining the content policy branch
 
-Companion to [Per user music content policy](per-user-content-policy.md). The initial deliverable is documentation only; no server behavior, database, client settings, or household playback changes.
+Companion to [User and player music content policy](per-user-content-policy.md). The design includes Apple-first metadata reuse, performance acceptance, and a staged risk/effort plan. The deliverable remains documentation only; no server behavior, database, client settings, or household playback changes. Existing branch and filenames remain stable for links and rebasing.
 
 ## Repository layout
 
@@ -65,7 +65,7 @@ If needed, use matching branches in forks of `music-assistant/models` and `music
 1. Record old upstream base, feature head and old remote feature SHA. Create a unique backup branch and fetch upstream.
 2. Rebase onto `upstream/dev`; resolve according to behavior rather than accepting either file wholesale.
 3. Review `git range-diff OLD_BASE..BACKUP_BRANCH upstream/dev..feature/per-user-content-policy` for dropped or altered patches.
-4. Re-audit identity, permissions, persistence, candidate fallback, preload/buffer reuse, routes, grouping and pagination. New upstream paths need coverage even when Git reports no conflicts.
+4. Re-audit identity, administrator-only player policy, durable persistence, candidate fallback, preload/buffer reuse, routes, grouping, Apple rating completeness/freshness, batching and pagination. New upstream paths need coverage even when Git reports no conflicts.
 5. Run acceptance tests, isolated migration fixtures, relevant upstream tests and required lint/type/pre-commit checks. Assert denial before audio acquisition/output.
 6. Record new upstream SHA, companion SHAs, patch head, test commands/results, client/provider versions and limitations. Push with an explicit lease after review.
 
