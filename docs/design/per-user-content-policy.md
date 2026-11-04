@@ -62,6 +62,24 @@ Apple exposes `contentRating` values `clean` and `explicit`; no value means no r
 
 No provider-specific HTTP calls in the evaluator. Use existing provider item-fetch methods, caches, and throttling. An iTunes lookup is not a dependency. Do not scrape lyrics, introduce new service credentials, expose provider audio URLs, or persist decoded streaming audio.
 
+## Provider independent contract
+
+The feature works for every music provider that supplies the normalized `MediaItemMetadata.explicit` field; Apple is the initial integration and performance validation target, not an enablement allowlist. Do not branch the evaluator on provider names or require a new provider capability flag just to honor an existing explicit marker.
+
+At the pinned source, Apple Music, Spotify, Tidal, Plex, local filesystem tags and several other providers populate this field. This is a common MA representation, not a universal standard of the external services. Provider coverage, field absence semantics, and recording identity can differ. A populated flag is usable immediately under the common evaluator; provider certification describes tested coverage, not whether known-explicit metadata is blocked.
+
+| Provider data | Shared behavior |
+| --- | --- |
+| Authoritative `explicit=True` for the exact track | Block under an explicit-blocking policy, for every provider |
+| Authoritative `explicit=False` for the exact track | Permit subject to access and other effective restrictions |
+| Authoritative complete metadata, flag absent/null | Apply unrated policy without repeated attempts to manufacture a rating |
+| Incomplete reference or untrusted client metadata | Resolve through existing provider methods/cache before admission |
+| Conflicting evidence or failed required lookup | Block or report unavailable; never downgrade to false |
+
+Provider adapters only normalize external fields and optionally optimize bulk metadata hydration. They do not duplicate user/player policy or queue/audio enforcement. Generic fallback uses existing provider item retrieval with bounded concurrency and shared caching; providers with a supported batch endpoint may supply a batch implementation. Lack of batch support affects cold-cache performance, not the policy semantics. Fresh complete listing metadata must remain sufficient without individual fetches across all providers.
+
+Add parameterized tests against a fake provider using true/false/null, including mixed-provider queues and provider switching. Verify a newly added provider with correctly populated metadata automatically inherits discovery and playback enforcement. Separately validate real providers' parser semantics, metadata completeness, fallback identities and rate limits before claiming full service coverage. Apple-specific performance improvements must not introduce Apple dependencies into common enforcement.
+
 ## Data and authority
 
 Names below describe proposed contracts, not existing APIs.
